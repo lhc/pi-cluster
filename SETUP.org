@@ -1,0 +1,226 @@
+* Instalar Raspbian na Master
+* Configurar DHCPD
+#+begin_src sh
+  $ sudo -s
+  # apt install -y isc-dhcp-server
+  # nano /etc/dhcp/dhcpd.conf
+  # systemctl restart isc-dhcp-server
+#+end_src
+
+Set the interfaces in which to listen on:
+=/etc/default/isc/dhcp/server=
+#+begin_src sh
+  INTERFACESv4="eth0"
+#+end_src
+
+
+In case of issues, check the logs:
+#+begin_src sh
+  # journalctl -xeu isc-dhcp-server
+#+end_src
+
+Remember configure a static address on the main interface:
+# TODO
+
+* Set up the slaves
+** Partition the SSD
+
+#+begin_src sh
+  # fdisk -l
+  # fdisk /dev/sda
+  g
+  n
+  w
+#+end_src
+
+Raspbian doesn't come with =btrfs-progrs= out of the box, so install it:
+#+begin_src sh
+  # apt install btrfs-progs
+#+end_src
+
+Then create the filesystem:
+#+begin_src sh
+  # mkfs.btrfs /dev/sda1
+#+end_src
+
+Add it to the fstab:
+=/dev/fstab=
+#+begin_src conf
+  /dev/sda1       /mnt/usb        btrfs       defaults    0   0
+#+end_src
+
+Then mount it:
+#+begin_src shell
+  # mkdir /mnt/usb
+  # mount /mnt/usb
+#+end_src
+
+** Set up the operating system image
+
+Go to https://www.raspberrypi.com/software/operating-systems/#raspberry-pi-os-64-bit and get yourself the link to a GUI-less image, then download it:
+#+begin_src sh
+  # cd /mnt/usb
+  # wget <link you copied> -Oos.img.xz
+#+end_src
+
+Extract
+#+begin_src sh
+  # unxz os.img.xz
+#+end_src
+
+Then mount
+#+begin_src sh
+  # dev=$(losetup -Pf --show os.img)
+  # mkdir mnt
+  # mount ${dev}p2 mnt
+#+end_src
+
+Finally, copy the filesystem over
+#+begin_src sh
+  # btrfs subvolume create slave
+  # rsync -av --info=progress2 mnt/ slave/
+#+end_src
+
+Unmount the main system
+#+begin_src sh
+  # umount mnt
+#+end_src
+
+Mount the firmware partition
+#+begin_src sh
+  # mount ${dev}p1
+#+end_src
+
+Copy it over, then get rid of it
+#+begin_src sh
+  # mkdir -p slave/boot/firmware
+  # rsync -av --info=progress2 mnt/ slave/boot/firmware
+  # umount mnt
+#+end_src
+
+*** Serve it over NFS
+Firstly, install the NFS server
+#+begin_src sh
+  # apt install nfs-kernel-server
+#+end_src
+
+Then enable the required services
+#+begin_src sh
+  # systemctl enable --now rpcbind
+  # systemctl enable --now nfs-server
+#+end_src
+
+Reload the export list, just in case
+#+begin_src sh
+  # exportfs -r
+#+end_src
+
+Then check if the exports look alright
+#+begin_src sh
+  # showmount -e localhost
+#+end_src
+
+*** Serve the boot files over TFTP
+Install the tftp server and create the required directory tree
+#+begin_src sh
+  # apt install tftp-hpa
+  # mkdir -p tftpboot
+  # chown tftp:tftp tftpboot
+#+end_src
+
+Configure the TFTP server
+#+begin_src sh
+  TFTP_USERNAME="tftp"
+  TFTP_DIRECTORY="/mnt/usb/tftpboot"
+  TFTP_ADDRESS=":69"
+  TFTP_OPTIONS="--secure --create"
+#+end_src
+
+Then restart it
+#+begin_src sh
+  # systemctl restart tftpd-hpa
+#+end_src
+
+Set up the firmware folder to be bound over the tree served by the TFTP server
+=/etc/fstab/=
+#+begin_src conf
+  /mnt/usb/slave/boot/firmware    /mnt/usb/tftpboot   none    bind    0   0
+#+end_src
+
+Then bind it
+#+begin_src sh
+  # mount -a
+#+end_src
+
+Configure the slave nodes to mount the root over NFS
+#+begin_src sh
+  echo 'console=serial0,115200 console=tty root=/dev/nfs nfsroot=10.0.0.1:/mnt/usb/slave,vers=3 rw ip=dhcp rootwait' > slave/boot/firmware/cmdline.txt
+#+end_src
+
+*** Configure the slave systems
+First of all, set up the slave's =/etc/fstab= to mount =/= from NFS
+=slave/etc/fstab=
+#+begin_src conf
+  pi-master:/mnt/usb/slave    /   nfs vers=3  0   0
+#+end_src
+Remember to remove the entries referring to the local filesystems (i.e. =/= and =/boot/firmware=).
+
+Add the master and slaves to the master's =/etc/hosts=
+#+begin_src conf
+  10.0.0.1    pi-master
+  10.0.0.2    pi-slave-01
+  10.0.0.3    pi-slave-03
+#+end_src
+
+Set the master's =/etc/hosts= to be bound over the slave's
+=/etc/fstab=
+#+begin_src conf
+  /etc/hosts      /mnt/usb/slave/etc/hosts    none    bind    0   0
+#+end_src
+
+Remove the hostname file so that the node gets it's hostname from DHCP
+#+begin_src sh
+  # rm slave/etc/fstab
+#+end_src
+
+**** Set up SSH
+Generate an ssh key on the master node
+#+begin_src sh
+  # ssh-keygen  -t rsa -b 4096 -C "pi@cluster"
+#+end_src
+
+Then copy it over to the slave root
+#+begin_src sh
+  # cat ~/.ssh/id_rsa.pub >> slave/root/.ssh/authorized_keys
+#+end_src
+
+**** Configure the system services 
+Chroot into the system
+#+begin_src sh
+  # for fs in dev proc sys; do mount -R {,slave}/$fs; done
+  # chroot slave /bin/bash
+  # . /etc/profile
+#+end_src
+
+Disable a few unecessary services
+#+begin_src sh
+  # systemctl disable resize2fs_once
+  # systemctl disable sshswitch
+  # systemctl disable userconfig
+  # apt remove dphys-swapfile
+#+end_src
+
+Enable =sshd=
+#+begin_src sh
+  # systemctl enable ssh
+#+end_src
+
+Then press =ctrl+d= to quit.
+** Configure the slave to boot over the network
+On the slave, boot a generic image, then, as root
+#+begin_src sh
+  # raspi-config
+#+end_src
+Navigate to =Advanced Options > Boot Order > Network Boot=, then reboot.
+
+At this point, your slave node should already be able to boot over the network.
